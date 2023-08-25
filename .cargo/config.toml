@@ -1,0 +1,1 @@
+rustflags = ["-C", "link-arg=-Wl,--compress-debug-sections=zlib,-fuse-ld=lld"]
