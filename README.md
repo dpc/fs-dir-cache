@@ -46,3 +46,4 @@ Using just one tool, it's easy to get correct and practical caching including:
 
 * locking (including fallback timeouts)
 * evicition
+* timeouts
