@@ -42,7 +42,7 @@ trap "fs-dir-cache unlock --dir ${cache_dir}" EXIT
 cargo build --target-dir="${cache_dir}/target"
 ```
 
-Using just one command, one can achieve a correct and practical caching including:
+Using just one tool, it's easy to get correct and practical caching including:
 
 * locking (including fallback timeouts)
 * evicition
