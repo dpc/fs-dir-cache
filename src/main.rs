@@ -1,69 +1,89 @@
-use std::path::PathBuf;
+mod root;
+mod util;
 
-use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
+use std::{fs, io};
+
+use anyhow::{format_err, Context, Result};
+use clap::{Args, Parser, Subcommand};
+use root::Root;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-struct Cli {
+struct Opts {
     #[command(subcommand)]
     command: Commands,
 }
 
+#[derive(Args)]
+/// Acquire a lock on cache key subdir in a given cache root
+/// directory. Waits if key is already locked.
+struct LockOpts {
+    /// Root cache dir
+    ///
+    /// Dir that will hold all the cache key subdirs
+    #[arg(long, env = "FS_DIR_CACHE_ROOT")]
+    root: PathBuf,
+
+    /// An id of a lock to use for `unlock`
+    #[arg(long, env = "FS_DIR_CACHE_LOCK_ID")]
+    lock_id: String,
+
+    /// Name of the cache
+    ///
+    /// Base part of the unique key identifying cache subdir
+    #[arg(long, env = "FS_DIR_CACHE_KEY_NAME")]
+    key_name: String,
+
+    /// A string to hash into the final cache subdir id
+    ///
+    /// Can be passed multiple times (order is significant).
+    #[arg(long)]
+    key_str: Vec<String>,
+
+    /// A path to a file to hash the content of into the final cache
+    /// subdir id
+    ///
+    /// Can be passed multiple times (order is significant).
+    #[arg(long)]
+    key_file: Vec<PathBuf>,
+
+    /// Unlock automatically after given amount of seconds, in case cleanup
+    /// never happens
+    #[arg(long)]
+    #[arg(long, env = "FS_DIR_CACHE_LOCK_TIMEOUT_SECS")]
+    timeout_secs: u64,
+}
+
+#[derive(Args)]
+/// Unlock the cache key dir
+struct UnlockOpts {
+    /// Cache key dir
+    #[arg(long)]
+    dir: PathBuf,
+
+    /// Lock used during `unlock`
+    #[arg(long, env = "FS_DIR_CACHE_LOCK_ID")]
+    lock_id: String,
+}
+
+#[derive(Args)]
+/// Garbage collect cache keys
+struct GC {
+    /// Root cache dir
+    #[arg(long, env = "FS_DIR_CACHE_ROOT")]
+    root: PathBuf,
+
+    #[command(subcommand)]
+    mode: GCModeCommand,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Create or reuse a cache subdirectory in a given cache root. Wait if
-    /// already locked.
-    Lock {
-        /// Root cache dir
-        ///
-        /// Directory that will hold all the cache subdirectories
-        #[arg(long, env = "FS_DIR_CACHE_ROOT")]
-        root: PathBuf,
-
-        /// An id of a lock to use for `unlock`
-        #[arg(long, env = "FS_DIR_CACHE_LOCK_ID")]
-        lock_id: String,
-
-        /// Name of the cache
-        ///
-        /// Base part of the unique key identifying cache subdirectory
-        #[arg(long, env = "FS_DIR_CACHE_KEY_NAME")]
-        key_name: String,
-
-        /// A string to hash into the final cache subdirectory id
-        ///
-        /// Can be passed multiple times. Not guaranteed to be stable
-        /// across `fs-dir-cache` versions.
-        #[arg(long)]
-        key_str: Vec<String>,
-
-        /// Unlock automatically after given amount of seconds, in case cleanup
-        /// never happens
-        #[arg(long)]
-        #[arg(long, env = "FS_DIR_CACHE_LOCK_TIMEOUT_SECS")]
-        timeout_secs: u32,
-    },
-
-    /// Unlock the cache subdirectory
-    Unlock {
-        /// Cache directory
-        #[arg(long)]
-        dir: String,
-
-        /// Lock used during `unlock`
-        #[arg(long, env = "FS_DIR_CACHE_LOCK_ID")]
-        lock_id: String,
-    },
-    /// Garbage collect
-    GC {
-        /// Root cache dir
-        #[arg(long, env = "FS_DIR_CACHE_ROOT")]
-        root: PathBuf,
-
-        #[command(subcommand)]
-        mode: GCModeCommand,
-    },
+    Lock(LockOpts),
+    Unlock(UnlockOpts),
+    GC(GC),
 }
 
 #[derive(Subcommand)]
@@ -75,11 +95,65 @@ enum GCModeCommand {
     },
 }
 
-fn main() {
+fn main() -> Result<()> {
     init_logging();
-    let _cli = Cli::parse();
+    let opts = Opts::parse();
 
-    todo!();
+    match opts.command {
+        Commands::Lock(lock_opts) => println!("{}", lock(lock_opts)?.display()),
+        Commands::Unlock(unlock_opts) => {
+            unlock(unlock_opts)?;
+        }
+        Commands::GC(GC { root: _, mode: _ }) => unimplemented!(),
+    }
+
+    Ok(())
+}
+
+fn lock(lock_opts: LockOpts) -> Result<PathBuf> {
+    let mut root = Root::new(&lock_opts.root)?;
+
+    let key = format!("{}-{}", lock_opts.key_name, get_cache_key(&lock_opts)?);
+    root.with_lock(|root| root.lock_key(&key, lock_opts.lock_id, lock_opts.timeout_secs))
+}
+
+fn unlock(unlock_opts: UnlockOpts) -> Result<()> {
+    let (root_dir, key) = split_key_dir_path(&unlock_opts.dir)?;
+    let mut root = Root::new(root_dir)?;
+
+    root.with_lock(|root| root.unlock_key(&key, unlock_opts.lock_id))
+}
+
+fn split_key_dir_path(dir: &Path) -> Result<(PathBuf, String)> {
+    let key = dir
+        .file_name()
+        .ok_or_else(|| format_err!("Path ends with invalid component: {}", dir.display()))?
+        .to_str()
+        .ok_or_else(|| format_err!("Path contains invalid characters: {}", dir.display()))?
+        .to_owned();
+
+    let parent = dir
+        .parent()
+        .ok_or_else(|| format_err!("Can't figure out parent: {}", dir.display()))?
+        .to_owned();
+
+    Ok((parent, key))
+}
+
+fn get_cache_key(lock_opts: &LockOpts) -> Result<String, anyhow::Error> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(lock_opts.key_name.as_bytes());
+    for key_str in &lock_opts.key_str {
+        hasher.update(key_str.as_bytes());
+    }
+    for key_file in &lock_opts.key_file {
+        let mut reader = fs::File::open(key_file)
+            .with_context(|| format!("Failed to open {}", key_file.display()))?;
+        io::copy(&mut reader, &mut hasher)
+            .with_context(|| format!("Failed to read {}", key_file.display()))?;
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn init_logging() {

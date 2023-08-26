@@ -26,14 +26,14 @@ set -euo pipefail
 FS_DIR_CACHE_ROOT="$HOME/.cache/fs-dir-cache" # directory to hold all cache (sub)directories
 FS_DIR_CACHE_LOCK_ID="pid-$$-rnd-$RANDOM"     # acquire lock based on the current pid and something random (just in case pid gets reused)
 FS_DIR_CACHE_KEY_NAME="build-project-x"       # the base name of our key
-FS_DIR_CACHE_KEY_LOCK_TIMEOUT_SECS="600"      # unlock after timeout in case our job fails misereably
+FS_DIR_CACHE_LOCK_TIMEOUT_SECS="600"      # unlock after timeout in case our job fails misereably
 
 fs-dir-cache gc unused --seconds "$((7 * 24 * 60 * 60))" # delete caches not used in more than a week
 
 # create/reuse cache (sub-directory) and lock it (wait if already locked)
 cache_dir=$(fs-dir-cache lock --key-file Cargo.toml)
 # unlock it when the script finish
-trap 'fs-dir-cache unlock' EXIT
+trap "fs-dir-cache unlock --dir ${cache_dir}" EXIT
 
 # 'cache_dir' will now equal to something like '/home/user/.cache/fs-dir-cache/build-project-x-8jg9hsadjfkaj9jkfljdfsd'
 # and script has up to 600s to use it exclusively
