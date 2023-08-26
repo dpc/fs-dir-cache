@@ -105,7 +105,7 @@ impl<'a> LockedRoot<'a> {
         Ok(())
     }
 
-    fn r#yield(&mut self, duration: Duration) -> Result<()> {
+    pub fn r#yield(&mut self, duration: Duration) -> Result<()> {
         self.unlock()?;
         thread::sleep(duration);
         self.lock()?;
@@ -124,40 +124,33 @@ impl<'a> LockedRoot<'a> {
         util::store_json_pretty_to_file(&self.data_file_path(), data)
     }
 
-    pub fn lock_key(&mut self, key: &str, lock_id: String, timeout_secs: u64) -> Result<PathBuf> {
-        self.ensure_locked()?;
+    pub fn lock_key(&mut self, key: &str, lock_id: &str, timeout_secs: u64) -> Result<PathBuf> {
         let data = loop {
             let mut data = self.load_data()?;
 
             let now = Utc::now();
-            let new_value = dto::KeyData {
-                locked_until: now
-                    .checked_add_signed(chrono::Duration::seconds(i64::try_from(timeout_secs)?))
-                    .ok_or_else(|| anyhow::format_err!("Timeout overflow"))?,
-                last_lock: now,
-                lock_id: lock_id.clone(),
-            };
             match data.keys.entry(key.to_owned()) {
                 Entry::Vacant(e) => {
-                    e.insert(new_value);
+                    e.insert(
+                        dto::KeyData::new(now)
+                            .lock(now, lock_id, timeout_secs)?
+                            .to_owned(),
+                    );
                     break data;
                 }
                 Entry::Occupied(mut e) => {
-                    let locked_until = e.get().locked_until;
-                    let expires = locked_until.signed_duration_since(now);
-                    if locked_until < now {
-                        *e.get_mut() = new_value;
+                    if !e.get().is_locked(now) {
+                        e.get_mut().lock(now, lock_id, timeout_secs)?;
+                        debug_assert!(e.get().is_locked(now));
                         break data;
                     } else {
-                        let expires_in_secs = expires.num_seconds();
+                        let expires_in_secs = e.get().expires_in(now).num_seconds();
                         let duration = Duration::from_secs(u64::expect_from(
                             (expires_in_secs / 10).clamp(1, 30),
                         ));
                         info!(
                             key,
-                            lock_id,
-                            expires_in_secs,
-                            "Cached locked. Waiting for the lock to be released..."
+                            lock_id, expires_in_secs, "Waiting for the key lock to be released..."
                         );
                         self.r#yield(duration)?;
                     }
@@ -171,8 +164,6 @@ impl<'a> LockedRoot<'a> {
     }
 
     pub fn unlock_key(&mut self, key: &str, lock_id: String) -> Result<()> {
-        self.ensure_locked()?;
-
         let mut data = self.load_data()?;
 
         if let Some(key_data) = data.keys.get_mut(key) {
@@ -185,15 +176,19 @@ impl<'a> LockedRoot<'a> {
                 );
             }
             let now = Utc::now();
-            if key_data.locked_until < now {
+            if !key_data.is_locked(now) {
                 warn!(key, "Lock already expired");
             }
-            key_data.locked_until = now;
+            key_data.unlock(now);
             self.store_data(&data)?;
         } else {
             bail!("Key {} does not exist", key);
         }
 
         Ok(())
+    }
+
+    pub fn key_dir_path(&self, key: &str) -> PathBuf {
+        self.path.join(key)
     }
 }

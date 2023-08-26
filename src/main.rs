@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use anyhow::{format_err, Context, Result};
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use root::Root;
+use tracing::debug;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -104,17 +106,62 @@ fn main() -> Result<()> {
         Commands::Unlock(unlock_opts) => {
             unlock(unlock_opts)?;
         }
-        Commands::GC(GC { root: _, mode: _ }) => unimplemented!(),
+        Commands::GC(gc_options) => gc(gc_options)?,
     }
 
     Ok(())
+}
+
+fn gc(gc_options: GC) -> Result<()> {
+    match gc_options.mode {
+        GCModeCommand::Unused { seconds } => {
+            let mut root = Root::new(&gc_options.root)?;
+
+            let now = Utc::now();
+            let deadline = now
+                .checked_sub_signed(chrono::Duration::seconds(
+                    i64::try_from(seconds).map_err(|_e| anyhow::format_err!("Timeout overflow"))?,
+                ))
+                .ok_or_else(|| anyhow::format_err!("Timeout overflow"))?;
+
+            debug!(%now, %deadline, "Looking for unused keys");
+
+            root.with_lock(|root| {
+                let mut data = root.load_data()?;
+
+                let to_delete =  data
+                    .keys
+                    .iter()
+                    .filter(|(key, v)| {
+                        debug!(key, last_locked = %v.last_lock, locked_until = %v.locked_until, "Checking key");
+                        !v.is_locked(now) && v.is_last_used_before(deadline)
+                    })
+                    .map(|(k, _v)| k.to_owned()).collect::<Vec<_>>();
+
+                  for key in to_delete   {
+                    let key_dir = root.key_dir_path(&key);
+                    if key_dir.try_exists()? {
+                        debug!(key_dir = %key_dir.display(), "Deleting key dir");
+                        fs::remove_dir_all(&key_dir).with_context(|| "Failed to delete")?;
+                    } else {
+                        debug!(key_dir = %key_dir.display(), "Does not exist")
+                    }
+                    data.keys.remove(&key);
+                    root.store_data(&data)?;
+                    println!("{}", key_dir.display());
+                }
+
+                Ok(())
+            })
+        }
+    }
 }
 
 fn lock(lock_opts: LockOpts) -> Result<PathBuf> {
     let mut root = Root::new(&lock_opts.root)?;
 
     let key = format!("{}-{}", lock_opts.key_name, get_cache_key(&lock_opts)?);
-    root.with_lock(|root| root.lock_key(&key, lock_opts.lock_id, lock_opts.timeout_secs))
+    root.with_lock(|root| root.lock_key(&key, &lock_opts.lock_id, lock_opts.timeout_secs))
 }
 
 fn unlock(unlock_opts: UnlockOpts) -> Result<()> {
