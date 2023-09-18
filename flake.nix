@@ -2,106 +2,78 @@
   description = "A CLI tool for CIs and build scripts, making file system based caching easy and correct (locking, eviction, etc.) ";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    crane = {
-      url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    fenix = {
-      url = "github:nix-community/fenix";
+    flakebox = {
+      url = "github:rustshop/flakebox?rev=36b349dc4e6802a0a26bafa4baef1f39fbf4e870";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, fenix }:
+  outputs = { self, nixpkgs, flake-utils, flakebox }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
+          overlays = [
+            (final: prev: {
+              # mold wrapper from https://discourse.nixos.org/t/using-mold-as-linker-prevents-libraries-from-being-found/18530/5
+              mold =
+                let
+                  bintools-wrapper = "${nixpkgs}/pkgs/build-support/bintools-wrapper";
+                in
+                prev.symlinkJoin {
+                  name = "mold";
+                  paths = [ prev.mold ];
+                  nativeBuildInputs = [ prev.makeWrapper ];
+                  suffixSalt = prev.lib.replaceStrings [ "-" "." ] [ "_" "_" ] prev.targetPlatform.config;
+                  postBuild = ''
+                    for bin in ${prev.mold}/bin/*; do
+                      rm $out/bin/"$(basename "$bin")"
+
+                      export prog="$bin"
+                      substituteAll "${bintools-wrapper}/ld-wrapper.sh" $out/bin/"$(basename "$bin")"
+                      chmod +x $out/bin/"$(basename "$bin")"
+
+                      mkdir -p $out/nix-support
+                      substituteAll "${bintools-wrapper}/add-flags.sh" $out/nix-support/add-flags.sh
+                      substituteAll "${bintools-wrapper}/add-hardening.sh" $out/nix-support/add-hardening.sh
+                      substituteAll "${bintools-wrapper}/../wrapper-common/utils.bash" $out/nix-support/utils.bash
+                    done
+                  '';
+                };
+            })
+          ];
+
         };
-        lib = pkgs.lib;
-        extLib = import ./nix/lib.nix { inherit lib; };
+        flakeboxLib = flakebox.lib.${system} { };
+        craneLib = flakeboxLib.craneLib;
 
-        fenixChannel = fenix.packages.${system}.stable;
-        fenixChannelNightly = fenix.packages.${system}.latest;
-
-        fenixToolchain = (fenixChannel.withComponents [
-          "rustc"
-          "cargo"
-          "clippy"
-          "rust-analysis"
-          "rust-src"
-        ]);
-
-        fenixToolchainRustfmt = (fenixChannelNightly.withComponents [
-          "rustfmt"
-        ]);
-
-        craneLib = crane.lib.${system}.overrideToolchain fenixToolchain;
-
-        commonArgs =
-          {
-            src = extLib.cleanSourceWithRel {
-              src = builtins.path {
-                name = "fs-dir-cache";
-                path = ./.;
-              };
-              filter = path: type:
-                (craneLib.filterCargoSources path type)
-              ;
-            };
-
-            buildInputs = [ ] ++ lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.libiconv
-              pkgs.darwin.apple_sdk.frameworks.Security
-            ];
-
-            nativeBuildInputs = builtins.attrValues
-              {
-                inherit (pkgs) lld mold;
-              } ++ [ ];
+        src = flakeboxLib.filter.filterSubdirs {
+          root = builtins.path {
+            name = "htmx-demo";
+            path = ./.;
           };
+          dirs = [
+            "Cargo.toml"
+            "Cargo.lock"
+            ".cargo"
+            "src"
+            "static"
+          ];
+        };
+
+        craneCommonArgs = {
+          inherit src;
+          nativeBuildInputs = [ pkgs.mold ];
+        };
       in
       {
-        packages. default = craneLib.buildPackage ({ } // commonArgs);
+        packages. default = craneLib.buildPackage craneCommonArgs;
 
         devShells = {
-          default = pkgs.mkShell {
-
-            buildInputs = [ ] ++ commonArgs.buildInputs;
-
-            nativeBuildInputs = builtins.attrValues
-              {
-                inherit (pkgs) cargo-watch;
-                inherit fenixToolchain fenixToolchainRustfmt;
-                inherit (pkgs) nixpkgs-fmt shellcheck rnix-lsp just;
-                inherit (pkgs) lld parallel typos convco;
-              } ++ [
-              # This is required to prevent a mangled bash shell in nix develop
-              # see: https://discourse.nixos.org/t/interactive-bash-with-nix-develop-flake/15486
-              (pkgs.hiPrio pkgs.bashInteractive)
-              pkgs.nodePackages.bash-language-server
-
-            ] ++ commonArgs.nativeBuildInputs;
-
-            shellHook = ''
-              dot_git="$(git rev-parse --git-common-dir)"
-              if [[ ! -d "$dot_git/hooks" ]]; then mkdir "$dot_git/hooks"; fi
-              chmod +x .git/hooks/{pre-commit,commit-msg}
-              for hook in misc/git-hooks/* ; do ln -sf "$(pwd)/$hook" "$dot_git/hooks/" ; done
-              ${pkgs.git}/bin/git config commit.template $(pwd)/misc/git-hooks/commit-template.txt
-
-              # if running in direnv
-              if [ -n "''${DIRENV_IN_ENVRC:-}" ]; then
-                # and not set DIRENV_LOG_FORMAT
-                if [ -n "''${DIRENV_LOG_FORMAT:-}" ]; then
-                  >&2 echo "💡 Set 'DIRENV_LOG_FORMAT=\"\"' in your shell environment variables for a cleaner output of direnv"
-                fi
-              fi
-
-              >&2 echo "💡 Run 'just' for a list of available 'just ...' helper recipes"
-            '';
+          default = flakeboxLib.mkDevShell {
+            packages = [ pkgs.mold ];
           };
         };
       }
