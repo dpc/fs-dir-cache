@@ -1,5 +1,5 @@
 {
-  description = "dpc's basic flake template";
+  description = "A CLI tool for CIs and build scripts, making file system based caching easy and correct (locking, eviction, etc.) ";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.05";
