@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     flakebox = {
-      url = "github:rustshop/flakebox?rev=36b349dc4e6802a0a26bafa4baef1f39fbf4e870";
+      url = "github:rustshop/flakebox?rev=d60061baec213962a897fe117e19ce1996c7f0a2";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -13,69 +13,48 @@
   outputs = { self, nixpkgs, flake-utils, flakebox }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [
-            (final: prev: {
-              # mold wrapper from https://discourse.nixos.org/t/using-mold-as-linker-prevents-libraries-from-being-found/18530/5
-              mold =
-                let
-                  bintools-wrapper = "${nixpkgs}/pkgs/build-support/bintools-wrapper";
-                in
-                prev.symlinkJoin {
-                  name = "mold";
-                  paths = [ prev.mold ];
-                  nativeBuildInputs = [ prev.makeWrapper ];
-                  suffixSalt = prev.lib.replaceStrings [ "-" "." ] [ "_" "_" ] prev.targetPlatform.config;
-                  postBuild = ''
-                    for bin in ${prev.mold}/bin/*; do
-                      rm $out/bin/"$(basename "$bin")"
+        projectName = "fs-dir-cache";
 
-                      export prog="$bin"
-                      substituteAll "${bintools-wrapper}/ld-wrapper.sh" $out/bin/"$(basename "$bin")"
-                      chmod +x $out/bin/"$(basename "$bin")"
-
-                      mkdir -p $out/nix-support
-                      substituteAll "${bintools-wrapper}/add-flags.sh" $out/nix-support/add-flags.sh
-                      substituteAll "${bintools-wrapper}/add-hardening.sh" $out/nix-support/add-hardening.sh
-                      substituteAll "${bintools-wrapper}/../wrapper-common/utils.bash" $out/nix-support/utils.bash
-                    done
-                  '';
-                };
-            })
-          ];
-
+        flakeboxLib = flakebox.lib.${system} {
+          config = {
+            github.ci.buildOutputs = [ ".#ci.${projectName}" ];
+          };
         };
-        flakeboxLib = flakebox.lib.${system} { };
-        craneLib = flakeboxLib.craneLib;
 
-        src = flakeboxLib.filter.filterSubdirs {
+        buildPaths = [
+          "Cargo.toml"
+          "Cargo.lock"
+          ".cargo"
+          "src"
+        ];
+
+        buildSrc = flakeboxLib.filterSubPaths {
           root = builtins.path {
-            name = "htmx-demo";
+            name = projectName;
             path = ./.;
           };
-          dirs = [
-            "Cargo.toml"
-            "Cargo.lock"
-            ".cargo"
-            "src"
-            "static"
-          ];
+          paths = buildPaths;
         };
 
-        craneCommonArgs = {
-          inherit src;
-          nativeBuildInputs = [ pkgs.mold ];
-        };
+        multiBuild =
+          (flakeboxLib.craneMultiBuild { }) (craneLib':
+            let
+              craneLib = (craneLib'.overrideArgs {
+                pname = projectName;
+                src = buildSrc;
+                nativeBuildInputs = [ ];
+              });
+            in
+            {
+              ${projectName} = craneLib.buildPackage { };
+            });
       in
       {
-        packages. default = craneLib.buildPackage craneCommonArgs;
+        packages.default = multiBuild.${projectName};
 
-        devShells = {
-          default = flakeboxLib.mkDevShell {
-            packages = [ pkgs.mold ];
-          };
-        };
+        legacyPackages = multiBuild;
+
+        devShells = flakeboxLib.mkShells { };
       }
     );
 }

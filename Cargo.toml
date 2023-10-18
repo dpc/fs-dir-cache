@@ -18,6 +18,12 @@ debug = "line-tables-only"
 [profile.release]
 debug = "line-tables-only"
 
+[profile.ci]
+inherits = "dev"
+incremental = false
+debug = "line-tables-only"
+lto = "off"
+
 [dependencies]
 anyhow = "1.0.75"
 blake3 = "1.4.1"
