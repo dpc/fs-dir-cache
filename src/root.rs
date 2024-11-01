@@ -1,6 +1,7 @@
 mod dto;
 
 use std::collections::btree_map::Entry;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs, thread};
@@ -11,7 +12,7 @@ use convi::ExpectFrom;
 use fs2::FileExt;
 use tracing::{debug, info, warn};
 
-use crate::util;
+use crate::{util, LOG_TARGET};
 
 /// Root directory of a cache
 pub struct Root {
@@ -39,7 +40,10 @@ impl Root {
 
 fn ensure_root_exists(dir: &PathBuf) -> Result<()> {
     if !dir.try_exists()? {
-        info!(dir = %dir.display(), "Creating root dir");
+        info!(
+            target: LOG_TARGET,
+            dir = %dir.display(), "Creating root dir"
+        );
         fs::create_dir_all(dir)?;
     }
     Ok(())
@@ -76,19 +80,31 @@ impl<'a> LockedRoot<'a> {
     }
 
     fn lock(&mut self) -> Result<()> {
-        debug!(path = %self.path.display(), "Acquiring cache lock...");
+        debug!(
+            target: LOG_TARGET,
+            path = %self.path.display(), "Acquiring cache lock..."
+        );
         if self.lock_file.try_lock_exclusive().is_err() {
-            info!("Cache lock taken, waiting...");
+            info!(
+                target: LOG_TARGET,
+                "Cache lock taken, waiting..."
+            );
             self.lock_file.lock_exclusive()?;
         };
-        debug!("Acquired cache lock");
+        debug!(
+            target: LOG_TARGET,
+            "Acquired cache lock"
+        );
         self.locked = true;
         Ok(())
     }
 
     fn unlock(&mut self) -> Result<()> {
         self.ensure_locked()?;
-        debug!(path = %self.path.display(), "Releasing cache lock...");
+        debug!(
+            target: LOG_TARGET,
+            path = %self.path.display(), "Releasing cache lock..."
+        );
         self.lock_file.unlock()?;
         self.locked = false;
         Ok(())
@@ -124,7 +140,15 @@ impl<'a> LockedRoot<'a> {
         util::store_json_pretty_to_file(&self.data_file_path(), data)
     }
 
-    pub fn lock_key(&mut self, key: &str, lock_id: &str, timeout_secs: u64) -> Result<PathBuf> {
+    pub fn lock_key(
+        &mut self,
+        key: &str,
+        lock_id: &str,
+        timeout_secs: u64,
+        new_socket_path: Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        let locking_start = Utc::now();
+        let mut had_to_wait = false;
         let data = loop {
             let mut data = self.load_data()?;
 
@@ -133,26 +157,65 @@ impl<'a> LockedRoot<'a> {
                 Entry::Vacant(e) => {
                     e.insert(
                         dto::KeyData::new(now)
-                            .lock(now, lock_id, timeout_secs)?
+                            .lock(now, lock_id, timeout_secs, new_socket_path.clone())?
                             .to_owned(),
                     );
                     break data;
                 }
                 Entry::Occupied(mut e) => {
                     if !e.get().is_locked(now) {
-                        e.get_mut().lock(now, lock_id, timeout_secs)?;
+                        e.get_mut()
+                            .lock(now, lock_id, timeout_secs, new_socket_path.clone())?;
                         debug_assert!(e.get().is_locked(now));
+                        debug!(
+                            target: LOG_TARGET,
+                            key, lock_id, "Previous lock expired"
+                        );
                         break data;
                     } else {
                         let expires_in_secs = e.get().expires_in(now).num_seconds();
-                        let duration = Duration::from_secs(u64::expect_from(
-                            (expires_in_secs / 10).clamp(1, 30),
-                        ));
-                        info!(
-                            key,
-                            lock_id, expires_in_secs, "Waiting for the key lock to be released..."
-                        );
-                        self.r#yield(duration)?;
+                        if let Some(prev_sock_path) = e.get().socket_path.clone() {
+                            if UnixStream::connect(&prev_sock_path).is_err() {
+                                debug!(
+                                    target: LOG_TARGET,
+                                    key,
+                                    lock_id,
+                                    sock_path = %prev_sock_path.display(),
+                                    "Previous lock holder seemed to have died"
+                                );
+                                e.get_mut().lock(
+                                    now,
+                                    lock_id,
+                                    timeout_secs,
+                                    new_socket_path.clone(),
+                                )?;
+                                break data;
+                            } else {
+                                info!(
+                                    target: LOG_TARGET,
+                                    key,
+                                    lock_id,
+                                    sock_path = %prev_sock_path.display(),
+                                    expires_in_secs,
+                                    "Previous lock holder seems still alive"
+                                );
+                                had_to_wait |= true;
+                                self.r#yield(Duration::from_secs(1))?;
+                            }
+                        } else {
+                            let duration = Duration::from_secs(u64::expect_from(
+                                (expires_in_secs / 10).clamp(1, 30),
+                            ));
+                            info!(
+                                target: LOG_TARGET,
+                                key,
+                                lock_id,
+                                expires_in_secs,
+                                "Waiting for the key lock to be released..."
+                            );
+                            had_to_wait |= true;
+                            self.r#yield(duration)?;
+                        }
                     }
                 }
             }
@@ -160,6 +223,15 @@ impl<'a> LockedRoot<'a> {
 
         self.store_data(&data)?;
 
+        if had_to_wait {
+            info!(
+                target: LOG_TARGET,
+                key,
+                lock_id,
+                wait_secs=%Utc::now().signed_duration_since(locking_start).num_seconds(),
+                "Acquired lock"
+            );
+        }
         Ok(self.path.join(key))
     }
 

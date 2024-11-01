@@ -1,15 +1,19 @@
 mod root;
 mod util;
 
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::{ffi, fs, io, process};
 
-use anyhow::{format_err, Context, Result};
+use anyhow::{bail, format_err, Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
+use rand::distributions::{Alphanumeric, DistString};
 use root::Root;
-use tracing::debug;
+use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
+
+const LOG_TARGET: &str = "fs_dir_cache";
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -58,7 +62,7 @@ struct LockOpts {
     timeout_secs: u64,
 }
 
-#[derive(Args)]
+#[derive(Args, Debug)]
 /// Unlock the cache key dir
 struct UnlockOpts {
     /// Cache key dir
@@ -81,10 +85,20 @@ struct GC {
     mode: GCModeCommand,
 }
 
+#[derive(Args)]
+struct ExecOpts {
+    #[clap(flatten)]
+    opts: LockOpts,
+
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    exec: Vec<ffi::OsString>,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Lock(LockOpts),
     Unlock(UnlockOpts),
+    Exec(ExecOpts),
     GC(GC),
 }
 
@@ -102,11 +116,63 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
 
     match opts.command {
-        Commands::Lock(lock_opts) => println!("{}", lock(lock_opts)?.display()),
+        Commands::Lock(lock_opts) => println!("{}", lock(lock_opts, None)?.display()),
         Commands::Unlock(unlock_opts) => {
             unlock(unlock_opts)?;
         }
         Commands::GC(gc_options) => gc(gc_options)?,
+        Commands::Exec(exec_opts) => run_exec(exec_opts)?,
+    }
+
+    Ok(())
+}
+
+fn run_exec(ExecOpts { opts, exec }: ExecOpts) -> Result<()> {
+    if exec.is_empty() {
+        bail!("Missing command");
+    }
+    let cmd_str = exec
+        .join(&ffi::OsString::from(" "))
+        .to_string_lossy()
+        .to_string();
+
+    let root = std::fs::canonicalize(&opts.root)?;
+
+    let sock_path = root.join(PathBuf::from(format!(
+        "lock-{}",
+        Alphanumeric.sample_string(&mut rand::thread_rng(), 10)
+    )));
+
+    debug!(
+        target: LOG_TARGET,
+        sock_path = %sock_path.display(),
+        "Binding liveness socket"
+    );
+    let _socket = UnixListener::bind(&sock_path)?;
+
+    assert!(UnixStream::connect(&sock_path).is_ok());
+
+    let exec_dir = lock(opts, Some(sock_path.clone()))?;
+
+    fs::create_dir_all(&exec_dir)?;
+
+    debug!(
+        target: LOG_TARGET,
+        cmd = ?exec, ?exec_dir, "Executing user command"
+    );
+    if !process::Command::new(&exec[0])
+        .args(&exec[1..])
+        .current_dir(exec_dir)
+        .status()
+        .context("Executing user command failed")?
+        .success()
+    {
+        error!(cmd = %cmd_str, "User command failed");
+        bail!("User command failed");
+    }
+
+    if let Err(err) = fs::remove_file(&sock_path) {
+        warn!(%err, sock_path=%sock_path.display(), "Error removing liveness socket")
     }
 
     Ok(())
@@ -124,7 +190,10 @@ fn gc(gc_options: GC) -> Result<()> {
                 ))
                 .ok_or_else(|| anyhow::format_err!("Timeout overflow"))?;
 
-            debug!(%now, %deadline, "Looking for unused keys");
+            debug!(
+                target: LOG_TARGET,
+                %now, %deadline, "Looking for unused keys"
+            );
 
             root.with_lock(|root| {
                 let mut data = root.load_data()?;
@@ -133,7 +202,10 @@ fn gc(gc_options: GC) -> Result<()> {
                     .keys
                     .iter()
                     .filter(|(key, v)| {
-                        debug!(key, last_locked = %v.last_lock, locked_until = %v.locked_until, "Checking key");
+                        debug!(
+                            target: LOG_TARGET,
+                            key, last_locked = %v.last_lock, locked_until = %v.locked_until, "Checking key"
+                        );
                         !v.is_locked(now) && v.is_last_used_before(deadline)
                     })
                     .map(|(k, _v)| k.to_owned()).collect::<Vec<_>>();
@@ -141,10 +213,16 @@ fn gc(gc_options: GC) -> Result<()> {
                   for key in to_delete   {
                     let key_dir = root.key_dir_path(&key);
                     if key_dir.try_exists()? {
-                        debug!(key_dir = %key_dir.display(), "Deleting key dir");
+                        debug!(
+                            target: LOG_TARGET,
+                            key_dir = %key_dir.display(), "Deleting key dir"
+                        );
                         fs::remove_dir_all(&key_dir).with_context(|| "Failed to delete")?;
                     } else {
-                        debug!(key_dir = %key_dir.display(), "Does not exist")
+                        debug!(
+                            target: LOG_TARGET,
+                            key_dir = %key_dir.display(), "Does not exist"
+                        )
                     }
                     data.keys.remove(&key);
                     root.store_data(&data)?;
@@ -157,11 +235,18 @@ fn gc(gc_options: GC) -> Result<()> {
     }
 }
 
-fn lock(lock_opts: LockOpts) -> Result<PathBuf> {
+fn lock(lock_opts: LockOpts, socket_path: Option<PathBuf>) -> Result<PathBuf> {
     let mut root = Root::new(&lock_opts.root)?;
 
     let key = format!("{}-{}", lock_opts.key_name, get_cache_key(&lock_opts)?);
-    root.with_lock(|root| root.lock_key(&key, &lock_opts.lock_id, lock_opts.timeout_secs))
+    root.with_lock(|root| {
+        root.lock_key(
+            &key,
+            &lock_opts.lock_id,
+            lock_opts.timeout_secs,
+            socket_path,
+        )
+    })
 }
 
 fn unlock(unlock_opts: UnlockOpts) -> Result<()> {

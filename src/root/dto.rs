@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ pub struct KeyData {
     pub locked_until: chrono::DateTime<chrono::Utc>,
     pub lock_id: String,
     pub last_lock: chrono::DateTime<chrono::Utc>,
+    pub socket_path: Option<PathBuf>,
 }
 
 impl KeyData {
@@ -28,13 +30,14 @@ impl KeyData {
         now: DateTime<Utc>,
         lock_id: &str,
         timeout_secs: u64,
+        socket_path: Option<PathBuf>,
     ) -> anyhow::Result<&mut Self> {
-        debug_assert!(!self.is_locked(now));
         self.locked_until = now
             .checked_add_signed(chrono::Duration::seconds(i64::try_from(timeout_secs)?))
             .ok_or_else(|| anyhow::format_err!("Timeout overflow"))?;
         self.last_lock = now;
         self.lock_id = lock_id.to_owned();
+        self.socket_path = socket_path;
 
         debug_assert!(self.is_locked(now));
         Ok(self)
@@ -50,6 +53,7 @@ impl KeyData {
             locked_until: now,
             lock_id: "".to_owned(),
             last_lock: now,
+            socket_path: None,
         };
         debug_assert!(!s.is_locked(now));
         s
