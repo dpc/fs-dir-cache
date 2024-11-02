@@ -3,7 +3,7 @@ mod dto;
 use std::collections::btree_map::Entry;
 use std::io::{self, Read as _};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs, thread};
 
@@ -179,24 +179,17 @@ impl<'a> LockedRoot<'a> {
                             target: LOG_TARGET,
                             key, lock_id, "Previous lock expired"
                         );
+                        if let Some(prev_sock_path) = e.get().socket_path.as_ref() {
+                            rm_prev_sock_path(prev_sock_path);
+                        }
                         e.get_mut()
                             .lock(now, lock_id, timeout_secs, new_socket_path.clone())?;
                         debug_assert!(e.get().is_locked(now));
-                        if let Some(prev_sock_path) = e.get().socket_path.clone() {
-                            if let Err(err) = fs::remove_file(&prev_sock_path) {
-                                if err.kind() != io::ErrorKind::NotFound {
-                                    warn!(target: LOG_TARGET,
-                                            %err,
-                                            sock_path = %prev_sock_path.display(),
-                                            "Could not remove stale unix socket");
-                                }
-                            }
-                        }
                         break data;
                     } else {
                         let expires_in_secs = e.get().expires_in(now).num_seconds();
-                        if let Some(prev_sock_path) = e.get().socket_path.clone() {
-                            if let Ok(mut s) = UnixStream::connect(&prev_sock_path) {
+                        if let Some(prev_sock_path) = e.get().socket_path.as_ref() {
+                            if let Ok(mut s) = UnixStream::connect(prev_sock_path) {
                                 info!(
                                     target: LOG_TARGET,
                                     key,
@@ -218,14 +211,7 @@ impl<'a> LockedRoot<'a> {
                                     sock_path = %prev_sock_path.display(),
                                     "Previous lock holder seemed to have died"
                                 );
-                                if let Err(err) = fs::remove_file(&prev_sock_path) {
-                                    if err.kind() != io::ErrorKind::NotFound {
-                                        warn!(target: LOG_TARGET,
-                                            %err,
-                                            sock_path = %prev_sock_path.display(),
-                                            "Could not remove stale unix socket");
-                                    }
-                                }
+                                rm_prev_sock_path(prev_sock_path);
                                 e.get_mut().lock(
                                     now,
                                     lock_id,
@@ -294,5 +280,16 @@ impl<'a> LockedRoot<'a> {
 
     pub fn key_dir_path(&self, key: &str) -> PathBuf {
         self.path.join(key)
+    }
+}
+
+fn rm_prev_sock_path(prev_sock_path: &Path) {
+    if let Err(err) = fs::remove_file(prev_sock_path) {
+        if err.kind() != io::ErrorKind::NotFound {
+            warn!(target: LOG_TARGET,
+                %err,
+                sock_path = %prev_sock_path.display(),
+                "Could not remove stale unix socket");
+        }
     }
 }

@@ -42,6 +42,7 @@ impl KeyData {
         debug_assert!(self.is_locked(now));
         Ok(self)
     }
+
     pub fn unlock(&mut self, now: DateTime<Utc>) -> &mut Self {
         self.locked_until = now;
         debug_assert!(!self.is_locked(now));
