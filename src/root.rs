@@ -1,6 +1,7 @@
 mod dto;
 
 use std::collections::btree_map::Entry;
+use std::io::Read as _;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -122,11 +123,21 @@ impl<'a> LockedRoot<'a> {
     }
 
     pub fn r#yield(&mut self, duration: Duration) -> Result<()> {
-        self.unlock()?;
-        thread::sleep(duration);
-        self.lock()?;
-        Ok(())
+        self.yield_with(|| {
+            thread::sleep(duration);
+        })
     }
+
+    pub fn r#yield_with<F, R>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce() -> R,
+    {
+        self.unlock()?;
+        let r = f();
+        self.lock()?;
+        Ok(r)
+    }
+
     pub fn load_data(&self) -> Result<dto::RootData> {
         self.ensure_locked()?;
         let path = self.data_file_path();
@@ -175,7 +186,21 @@ impl<'a> LockedRoot<'a> {
                     } else {
                         let expires_in_secs = e.get().expires_in(now).num_seconds();
                         if let Some(prev_sock_path) = e.get().socket_path.clone() {
-                            if UnixStream::connect(&prev_sock_path).is_err() {
+                            if let Ok(mut s) = UnixStream::connect(&prev_sock_path) {
+                                info!(
+                                    target: LOG_TARGET,
+                                    key,
+                                    lock_id,
+                                    sock_path = %prev_sock_path.display(),
+                                    expires_in_secs,
+                                    "Previous lock holder seems still alive"
+                                );
+                                had_to_wait |= true;
+                                self.r#yield_with(|| {
+                                    // we are just waiting to get disconnected here
+                                    let _ = s.read(&mut [0]);
+                                })?;
+                            } else {
                                 debug!(
                                     target: LOG_TARGET,
                                     key,
@@ -190,17 +215,6 @@ impl<'a> LockedRoot<'a> {
                                     new_socket_path.clone(),
                                 )?;
                                 break data;
-                            } else {
-                                info!(
-                                    target: LOG_TARGET,
-                                    key,
-                                    lock_id,
-                                    sock_path = %prev_sock_path.display(),
-                                    expires_in_secs,
-                                    "Previous lock holder seems still alive"
-                                );
-                                had_to_wait |= true;
-                                self.r#yield(Duration::from_secs(1))?;
                             }
                         } else {
                             let duration = Duration::from_secs(u64::expect_from(
