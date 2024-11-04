@@ -155,7 +155,7 @@ impl<'a> LockedRoot<'a> {
         &mut self,
         key: &str,
         lock_id: &str,
-        timeout_secs: u64,
+        timeout_secs: f64,
         new_socket_path: Option<PathBuf>,
     ) -> Result<PathBuf> {
         let locking_start = Utc::now();
@@ -217,15 +217,15 @@ impl<'a> LockedRoot<'a> {
                             .lock(now, lock_id, timeout_secs, new_socket_path.clone())?;
                         break data;
                     } else {
-                        let expires_in_secs = e.get().expires_in(now).num_seconds();
-                        let duration = Duration::from_secs(u64::expect_from(
-                            (expires_in_secs / 10).clamp(1, 30),
+                        let expires_in_msecs = e.get().expires_in(now).num_milliseconds();
+                        let duration = Duration::from_millis(u64::expect_from(
+                            (expires_in_msecs / 100).clamp(10, 10000),
                         ));
                         info!(
                             target: LOG_TARGET,
                             key,
                             lock_id,
-                            expires_in_secs,
+                            expires_in_msecs,
                             "Waiting for the key lock to be released..."
                         );
                         had_to_wait |= true;

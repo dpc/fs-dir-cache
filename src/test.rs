@@ -14,7 +14,7 @@ fn sanity_check() -> Result<()> {
     let root_dir = tempfile::tempdir()?;
 
     thread::scope(|s| -> Result<()> {
-        for _ in 0..5 {
+        for _ in 0..10 {
             s.spawn(|| -> Result<()> {
                 let mut cmd = our_bin_cmd();
 
@@ -27,7 +27,7 @@ fn sanity_check() -> Result<()> {
                     "--lock-id",
                     "lockid",
                     "--timeout-secs",
-                    "10",
+                    "5",
                 ]);
 
                 let dir_str = ffi::OsString::from_str(
@@ -40,7 +40,7 @@ fn sanity_check() -> Result<()> {
                 let testfile_path = dir_path.join("test");
 
                 fs::write(&testfile_path, [])?;
-                thread::sleep(Duration::from_millis(900));
+                thread::sleep(Duration::from_millis(200));
                 fs::remove_file(&testfile_path)?;
 
                 let mut cmd = our_bin_cmd();
@@ -68,7 +68,7 @@ fn sanity_check() -> Result<()> {
                     "--",
                     "bash",
                     "-c",
-                    "set -e; test ! -e test; touch test; sleep .9; test -e test; rm test",
+                    "set -e; test ! -e test; touch test; sleep .2; test -e test; rm test",
                 ]);
 
                 cmd.assert().success();

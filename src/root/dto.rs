@@ -29,11 +29,13 @@ impl KeyData {
         &mut self,
         now: DateTime<Utc>,
         lock_id: &str,
-        timeout_secs: u64,
+        timeout_secs: f64,
         socket_path: Option<PathBuf>,
     ) -> anyhow::Result<&mut Self> {
         self.locked_until = now
-            .checked_add_signed(chrono::Duration::seconds(i64::try_from(timeout_secs)?))
+            .checked_add_signed(chrono::Duration::milliseconds(
+                (timeout_secs * 1000.0).round() as i64,
+            ))
             .ok_or_else(|| anyhow::format_err!("Timeout overflow"))?;
         self.last_lock = now;
         self.lock_id = lock_id.to_owned();

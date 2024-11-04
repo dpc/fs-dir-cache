@@ -60,7 +60,7 @@ struct LockOpts {
     /// never happens
     #[arg(long)]
     #[arg(long, env = "FS_DIR_CACHE_LOCK_TIMEOUT_SECS")]
-    timeout_secs: u64,
+    timeout_secs: f64,
 }
 
 #[derive(Args, Debug)]
