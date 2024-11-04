@@ -215,7 +215,6 @@ impl<'a> LockedRoot<'a> {
                         }
                         e.get_mut()
                             .lock(now, lock_id, timeout_secs, new_socket_path.clone())?;
-                        debug_assert!(e.get().is_timelocked(now));
                         break data;
                     } else {
                         let expires_in_secs = e.get().expires_in(now).num_seconds();

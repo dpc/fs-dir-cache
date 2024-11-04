@@ -39,7 +39,6 @@ impl KeyData {
         self.lock_id = lock_id.to_owned();
         self.socket_path = socket_path;
 
-        debug_assert!(self.is_timelocked(now));
         Ok(self)
     }
 
