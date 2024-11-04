@@ -174,7 +174,38 @@ impl<'a> LockedRoot<'a> {
                     break data;
                 }
                 Entry::Occupied(mut e) => {
-                    if !e.get().is_locked(now) {
+                    if let Some(prev_sock_path) = e.get().socket_path.as_ref() {
+                        if let Ok(mut s) = UnixStream::connect(prev_sock_path) {
+                            info!(
+                                target: LOG_TARGET,
+                                key,
+                                lock_id,
+                                sock_path = %prev_sock_path.display(),
+                                "Previous lock holder still alive"
+                            );
+                            had_to_wait |= true;
+                            self.r#yield_with(|| {
+                                // we are just waiting to get disconnected here
+                                let _ = s.read(&mut [0]);
+                            })?;
+                        } else {
+                            debug!(
+                                target: LOG_TARGET,
+                                key,
+                                lock_id,
+                                sock_path = %prev_sock_path.display(),
+                                "Previous lock holder gone"
+                            );
+                            rm_prev_sock_path(prev_sock_path);
+                            e.get_mut().lock(
+                                now,
+                                lock_id,
+                                timeout_secs,
+                                new_socket_path.clone(),
+                            )?;
+                            break data;
+                        }
+                    } else if !e.get().is_timelocked(now) {
                         debug!(
                             target: LOG_TARGET,
                             key, lock_id, "Previous lock expired"
@@ -184,56 +215,22 @@ impl<'a> LockedRoot<'a> {
                         }
                         e.get_mut()
                             .lock(now, lock_id, timeout_secs, new_socket_path.clone())?;
-                        debug_assert!(e.get().is_locked(now));
+                        debug_assert!(e.get().is_timelocked(now));
                         break data;
                     } else {
                         let expires_in_secs = e.get().expires_in(now).num_seconds();
-                        if let Some(prev_sock_path) = e.get().socket_path.as_ref() {
-                            if let Ok(mut s) = UnixStream::connect(prev_sock_path) {
-                                info!(
-                                    target: LOG_TARGET,
-                                    key,
-                                    lock_id,
-                                    sock_path = %prev_sock_path.display(),
-                                    expires_in_secs,
-                                    "Previous lock holder seems still alive"
-                                );
-                                had_to_wait |= true;
-                                self.r#yield_with(|| {
-                                    // we are just waiting to get disconnected here
-                                    let _ = s.read(&mut [0]);
-                                })?;
-                            } else {
-                                debug!(
-                                    target: LOG_TARGET,
-                                    key,
-                                    lock_id,
-                                    sock_path = %prev_sock_path.display(),
-                                    "Previous lock holder seemed to have died"
-                                );
-                                rm_prev_sock_path(prev_sock_path);
-                                e.get_mut().lock(
-                                    now,
-                                    lock_id,
-                                    timeout_secs,
-                                    new_socket_path.clone(),
-                                )?;
-                                break data;
-                            }
-                        } else {
-                            let duration = Duration::from_secs(u64::expect_from(
-                                (expires_in_secs / 10).clamp(1, 30),
-                            ));
-                            info!(
-                                target: LOG_TARGET,
-                                key,
-                                lock_id,
-                                expires_in_secs,
-                                "Waiting for the key lock to be released..."
-                            );
-                            had_to_wait |= true;
-                            self.r#yield(duration)?;
-                        }
+                        let duration = Duration::from_secs(u64::expect_from(
+                            (expires_in_secs / 10).clamp(1, 30),
+                        ));
+                        info!(
+                            target: LOG_TARGET,
+                            key,
+                            lock_id,
+                            expires_in_secs,
+                            "Waiting for the key lock to be released..."
+                        );
+                        had_to_wait |= true;
+                        self.r#yield(duration)?;
                     }
                 }
             }
@@ -266,7 +263,7 @@ impl<'a> LockedRoot<'a> {
                 );
             }
             let now = Utc::now();
-            if !key_data.is_locked(now) {
+            if !key_data.is_timelocked(now) {
                 warn!(key, "Lock already expired");
             }
             key_data.unlock(now);

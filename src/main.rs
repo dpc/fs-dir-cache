@@ -23,18 +23,12 @@ struct Opts {
 }
 
 #[derive(Args)]
-/// Acquire a lock on cache key subdir in a given cache root
-/// directory. Waits if key is already locked.
-struct LockOpts {
+struct CommonLockOpts {
     /// Root cache dir
     ///
     /// Dir that will hold all the cache key subdirs
     #[arg(long, env = "FS_DIR_CACHE_ROOT")]
     root: PathBuf,
-
-    /// An id of a lock to use for `unlock`
-    #[arg(long, env = "FS_DIR_CACHE_LOCK_ID")]
-    lock_id: String,
 
     /// Name of the cache
     ///
@@ -54,6 +48,13 @@ struct LockOpts {
     /// Can be passed multiple times (order is significant).
     #[arg(long)]
     key_file: Vec<PathBuf>,
+}
+
+#[derive(Args)]
+struct LockOpts {
+    /// An id of a lock to use for `unlock`
+    #[arg(long, env = "FS_DIR_CACHE_LOCK_ID")]
+    lock_id: String,
 
     /// Unlock automatically after given amount of seconds, in case cleanup
     /// never happens
@@ -88,7 +89,7 @@ struct GC {
 #[derive(Args)]
 struct ExecOpts {
     #[clap(flatten)]
-    opts: LockOpts,
+    opts: CommonLockOpts,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     exec: Vec<ffi::OsString>,
@@ -96,8 +97,18 @@ struct ExecOpts {
 
 #[derive(Subcommand)]
 enum Commands {
-    Lock(LockOpts),
+    /// Acquire a lock on cache key subdir in a given cache root
+    /// directory. Waits if key is already locked.
+    Lock {
+        #[clap(flatten)]
+        common: CommonLockOpts,
+        #[clap(flatten)]
+        lock: LockOpts,
+    },
+    /// Unlock the lock manually
     Unlock(UnlockOpts),
+    /// Run a command with lock acquired, allows for automatic and reliable
+    /// unlocking after command finishes.
     Exec(ExecOpts),
     GC(GC),
 }
@@ -116,7 +127,10 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
 
     match opts.command {
-        Commands::Lock(lock_opts) => println!("{}", lock(lock_opts, None)?.display()),
+        Commands::Lock {
+            common: common_opts,
+            lock: lock_opts,
+        } => println!("{}", lock(Some(lock_opts), common_opts, None)?.display()),
         Commands::Unlock(unlock_opts) => {
             unlock(unlock_opts)?;
         }
@@ -152,7 +166,7 @@ fn run_exec(ExecOpts { opts, exec }: ExecOpts) -> Result<()> {
 
     assert!(UnixStream::connect(&sock_path).is_ok());
 
-    let exec_dir = lock(opts, Some(sock_path.clone()))?;
+    let exec_dir = lock(None, opts, Some(sock_path.clone()))?;
 
     fs::create_dir_all(&exec_dir)?;
 
@@ -206,7 +220,7 @@ fn gc(gc_options: GC) -> Result<()> {
                             target: LOG_TARGET,
                             key, last_locked = %v.last_lock, locked_until = %v.locked_until, "Checking key"
                         );
-                        !v.is_locked(now) && v.is_last_used_before(deadline)
+                        !v.is_timelocked(now) && v.is_last_used_before(deadline)
                     })
                     .map(|(k, _v)| k.to_owned()).collect::<Vec<_>>();
 
@@ -235,15 +249,22 @@ fn gc(gc_options: GC) -> Result<()> {
     }
 }
 
-fn lock(lock_opts: LockOpts, socket_path: Option<PathBuf>) -> Result<PathBuf> {
-    let mut root = Root::new(&lock_opts.root)?;
+fn lock(
+    lock_opts: Option<LockOpts>,
+    common_opts: CommonLockOpts,
+    socket_path: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let mut root = Root::new(&common_opts.root)?;
 
-    let key = format!("{}-{}", lock_opts.key_name, get_cache_key(&lock_opts)?);
+    let key = format!("{}-{}", common_opts.key_name, get_cache_key(&common_opts)?);
     root.with_lock(|root| {
         root.lock_key(
             &key,
-            &lock_opts.lock_id,
-            lock_opts.timeout_secs,
+            &lock_opts
+                .as_ref()
+                .map(|o| o.lock_id.clone())
+                .unwrap_or_else(|| format!("exec-{}", std::process::id())),
+            lock_opts.map(|o| o.timeout_secs).unwrap_or_default(),
             socket_path,
         )
     })
@@ -272,13 +293,13 @@ fn split_key_dir_path(dir: &Path) -> Result<(PathBuf, String)> {
     Ok((parent, key))
 }
 
-fn get_cache_key(lock_opts: &LockOpts) -> Result<String, anyhow::Error> {
+fn get_cache_key(common_lock_opts: &CommonLockOpts) -> Result<String, anyhow::Error> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(lock_opts.key_name.as_bytes());
-    for key_str in &lock_opts.key_str {
+    hasher.update(common_lock_opts.key_name.as_bytes());
+    for key_str in &common_lock_opts.key_str {
         hasher.update(key_str.as_bytes());
     }
-    for key_file in &lock_opts.key_file {
+    for key_file in &common_lock_opts.key_file {
         let mut reader = fs::File::open(key_file)
             .with_context(|| format!("Failed to open {}", key_file.display()))?;
         io::copy(&mut reader, &mut hasher)

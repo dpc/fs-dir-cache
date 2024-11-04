@@ -13,7 +13,7 @@ pub struct KeyData {
 }
 
 impl KeyData {
-    pub fn is_locked(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_timelocked(&self, now: DateTime<Utc>) -> bool {
         now < self.locked_until
     }
 
@@ -39,13 +39,13 @@ impl KeyData {
         self.lock_id = lock_id.to_owned();
         self.socket_path = socket_path;
 
-        debug_assert!(self.is_locked(now));
+        debug_assert!(self.is_timelocked(now));
         Ok(self)
     }
 
     pub fn unlock(&mut self, now: DateTime<Utc>) -> &mut Self {
         self.locked_until = now;
-        debug_assert!(!self.is_locked(now));
+        debug_assert!(!self.is_timelocked(now));
         self
     }
 
@@ -56,7 +56,7 @@ impl KeyData {
             last_lock: now,
             socket_path: None,
         };
-        debug_assert!(!s.is_locked(now));
+        debug_assert!(!s.is_timelocked(now));
         s
     }
 }
