@@ -1,8 +1,9 @@
 mod dto;
 
 use std::collections::btree_map::Entry;
-use std::io::{self, Read as _};
-use std::os::unix::net::UnixStream;
+use std::io::{self};
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs, thread};
@@ -175,18 +176,22 @@ impl<'a> LockedRoot<'a> {
                 }
                 Entry::Occupied(mut e) => {
                     if let Some(prev_sock_path) = e.get().socket_path.as_ref() {
-                        if let Ok(mut s) = UnixStream::connect(prev_sock_path) {
+                        if let Ok(s) = try_lock(prev_sock_path) {
                             info!(
                                 target: LOG_TARGET,
                                 key,
                                 lock_id,
                                 sock_path = %prev_sock_path.display(),
-                                "Previous lock holder still alive"
+                                "Previous lock holder still alive (potentially)"
                             );
                             had_to_wait |= true;
                             self.r#yield_with(|| {
-                                // we are just waiting to get disconnected here
-                                let _ = s.read(&mut [0]);
+                                let _ = clear_lock(s, prev_sock_path).inspect_err(|err| {
+                                    info!(
+                                        %err,
+                                        "Error during waiting for / clearing the old lock"
+                                    )
+                                });
                             })?;
                         } else {
                             debug!(
@@ -288,4 +293,67 @@ fn rm_prev_sock_path(prev_sock_path: &Path) {
                 "Could not remove stale unix socket");
         }
     }
+}
+
+// On Darwin Unix Sockets are not automatically removed, and linger,
+// with processes that try to connect to them just hanging. This makes them
+// unsuitable for our needs. Just use a file that we lock exclusively.
+#[cfg(target_os = "macos")]
+pub fn mk_lock(path: &Path) -> Result<fs::File> {
+    let lock_file = fs::File::create(path)?;
+    lock_file.lock_exclusive()?;
+    Ok(lock_file)
+}
+
+// On Linux we can use Unix Sockets as they disappear automatically,
+// which is nice.
+#[cfg(not(target_os = "macos"))]
+pub fn mk_lock(path: &Path) -> Result<UnixListener> {
+    use std::os::unix::net::UnixStream;
+
+    let socket = UnixListener::bind(path)?;
+
+    assert!(UnixStream::connect(path).is_ok());
+
+    Ok(socket)
+}
+
+#[cfg(target_os = "macos")]
+pub fn try_lock(path: &Path) -> Result<fs::File> {
+    let lock_file = fs::File::open(path)?;
+    Ok(lock_file)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_lock(path: &Path) -> Result<UnixStream> {
+    let socket = UnixStream::connect(path)?;
+
+    Ok(socket)
+}
+
+#[cfg(target_os = "macos")]
+pub fn clear_lock(file: fs::File, path: &Path) -> Result<()> {
+    file.lock_exclusive()?;
+
+    // We want to unlock the file, even if we failed to remove it
+    let rm_res = fs::remove_file(path);
+
+    file.unlock()?;
+
+    // if removing failed, report it now
+    rm_res?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn clear_lock(mut s: UnixStream, _path: &Path) -> Result<()> {
+    // we are just waiting to get disconnected here
+
+    use std::io::Read as _;
+
+    // ignore, we *will* disconnect, nothing interesting about it
+    let _ = s.read(&mut [0]);
+
+    Ok(())
 }

@@ -1,7 +1,6 @@
 mod root;
 mod util;
 
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::{ffi, fs, io, process};
 
@@ -9,7 +8,7 @@ use anyhow::{bail, format_err, Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use rand::distributions::{Alphanumeric, DistString};
-use root::Root;
+use root::{mk_lock, Root};
 use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -154,7 +153,7 @@ fn run_exec(ExecOpts { opts, exec }: ExecOpts) -> Result<()> {
 
     let sock_path = root.join(PathBuf::from(format!(
         "lock-{}",
-        Alphanumeric.sample_string(&mut rand::thread_rng(), 10)
+        Alphanumeric.sample_string(&mut rand::thread_rng(), 16)
     )));
 
     debug!(
@@ -162,9 +161,8 @@ fn run_exec(ExecOpts { opts, exec }: ExecOpts) -> Result<()> {
         sock_path = %sock_path.display(),
         "Binding liveness socket"
     );
-    let _socket = UnixListener::bind(&sock_path)?;
 
-    assert!(UnixStream::connect(&sock_path).is_ok());
+    let _lock = mk_lock(&sock_path)?;
 
     let exec_dir = lock(None, opts, Some(sock_path.clone()))?;
 
