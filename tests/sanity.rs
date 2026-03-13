@@ -5,17 +5,16 @@ use std::str::FromStr;
 use std::time::Duration;
 use std::{ffi, fs, thread};
 
-use anyhow::Result;
 use assert_cmd::assert::OutputAssertExt as _;
 use assert_cmd::cargo;
 
 #[test]
-fn sanity_check() -> Result<()> {
+fn sanity_check() -> anyhow::Result<()> {
     let root_dir = tempfile::tempdir()?;
 
-    thread::scope(|s| -> Result<()> {
+    thread::scope(|s| -> anyhow::Result<()> {
         for _ in 0..10 {
-            s.spawn(|| -> Result<()> {
+            s.spawn(|| -> anyhow::Result<()> {
                 let mut cmd = our_bin_cmd();
 
                 cmd.env("FS_DIR_CACHE_ROOT", root_dir.path());
@@ -56,7 +55,7 @@ fn sanity_check() -> Result<()> {
                 Ok(())
             });
 
-            s.spawn(|| -> Result<()> {
+            s.spawn(|| -> anyhow::Result<()> {
                 let mut cmd = our_bin_cmd();
 
                 cmd.stderr(Stdio::inherit());
