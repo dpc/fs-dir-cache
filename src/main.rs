@@ -317,6 +317,3 @@ fn init_logging() {
 
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
-
-#[cfg(test)]
-mod test;
